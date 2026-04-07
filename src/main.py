@@ -1,0 +1,1 @@
+print("Docker + Git osnovni setup deluje ✅")
