@@ -81,25 +81,32 @@ def overlay_text(frame, lines, x=10, y=20, dy=22):
 # ── Zaznavanje lukenj za umerjanje ────────────────────────────────────────────
 
 def detect_holes(frame):
+    """
+    Zazna svetle luknje z iskanjem svetlih krožnih kontur.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    params = cv2.SimpleBlobDetector_Params()
-    params.filterByColor       = True
-    params.blobColor           = 255
-    params.filterByArea        = True
-    params.minArea             = 40        # bilo 50 - znižamo
-    params.maxArea             = 600       # bilo 3000 - znižamo, luknje so ~50-70
-    params.filterByCircularity = True
-    params.minCircularity      = 0.4       # bilo 0.6 - znižamo ker so luknje 9x10
-    params.filterByConvexity   = True
-    params.minConvexity        = 0.6       # bilo 0.7
-    params.filterByInertia     = True
-    params.minInertiaRatio     = 0.3       # bilo 0.4
-
-    detector = cv2.SimpleBlobDetector_create(params)
-    keypoints = detector.detect(gray)
-
-    centers = [(int(kp.pt[0]), int(kp.pt[1])) for kp in keypoints]
+    
+    # Prag za svetle pike
+    _, bright = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    
+    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    centers = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if 40 < area < 600:
+            # Preveri krožnost
+            perimeter = cv2.arcLength(c, True)
+            if perimeter == 0:
+                continue
+            circularity = 4 * np.pi * area / (perimeter ** 2)
+            if circularity > 0.3:
+                M = cv2.moments(c)
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    centers.append((cx, cy))
+    
     return centers
 
 
