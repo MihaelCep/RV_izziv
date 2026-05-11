@@ -2,9 +2,6 @@
 Nine-Hole Peg Test (9HPT) – Robotski vid izziv
 Določanje kinematičnih parametrov gibanja roke iz enega pogleda.
 
-Rešitev temelji na MediaPipe Hands za zaznavo roke in prstov,
-sledenje skozi čas ter izračun d/v/a parametrov.
-
 Uporaba:
     python src/main.py --input data/video.mp4 --output data/results/
     python src/main.py --input 0   (webcam)
@@ -22,7 +19,6 @@ import time
 
 # ── Konstante ─────────────────────────────────────────────────────────────────
 
-# MediaPipe indeksi landmarks
 WRIST       = 0
 THUMB_TIP   = 4
 INDEX_TIP   = 8
@@ -30,32 +26,42 @@ MIDDLE_TIP  = 12
 RING_TIP    = 16
 PINKY_TIP   = 20
 
-# Gladilno okno za hitrost/pospešek (zmanjša šum)
 SMOOTH_WINDOW = 5
 
-# Barve (BGR)
 COLOR_HAND   = (0, 255, 0)
 COLOR_THUMB  = (255, 100,   0)
 COLOR_INDEX  = (0,   100, 255)
 COLOR_TRAIL  = (200, 200,   0)
 COLOR_TEXT   = (255, 255, 255)
+COLOR_GRIP   = (0, 0, 255)
+COLOR_RELEASE= (0, 255, 0)
+
+# 9HPT plošča – znane dimenzije
+HOLE_DIAMETER_MM   = 10.0
+HOLE_GRID_ROWS     = 3
+HOLE_GRID_COLS     = 3
+BOARD_WIDTH_MM     = 320.0
+BOARD_HEIGHT_MM    = 130.0
+
+# Prag za zaznavanje prijema (razdalja med palcem in kazalcem v mm)
+GRIP_THRESHOLD_MM  = 35.0
+
+# Koliko okvirjev na začetku uporabimo za umerjanje
+CALIB_FRAMES       = 50
 
 # ── Pomožne funkcije ───────────────────────────────────────────────────────────
 
 def pixel_distance(p1, p2):
-    """Evklidska razdalja med dvema točkama (px)."""
     return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
 
 def smooth(values, window=SMOOTH_WINDOW):
-    """Drseče povprečje za glajenje signala."""
     if len(values) < window:
         return values[-1] if values else 0.0
     return float(np.mean(list(values)[-window:]))
 
 
 def draw_trail(frame, trail, color, max_len=60):
-    """Nariše sled gibanja točke."""
     pts = list(trail)[-max_len:]
     for i in range(1, len(pts)):
         if pts[i-1] is not None and pts[i] is not None:
@@ -65,7 +71,6 @@ def draw_trail(frame, trail, color, max_len=60):
 
 
 def overlay_text(frame, lines, x=10, y=20, dy=22):
-    """Izpiše seznam vrstic besedila na frame."""
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (x, y + i * dy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
@@ -73,22 +78,129 @@ def overlay_text(frame, lines, x=10, y=20, dy=22):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_TEXT, 1, cv2.LINE_AA)
 
 
+# ── Zaznavanje lukenj za umerjanje ────────────────────────────────────────────
+
+def detect_holes(frame):
+    """
+    Zazna svetle luknje na plošči z blob detektorjem.
+    Vrne seznam centrov lukenj v pikslih ali prazen seznam.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    params = cv2.SimpleBlobDetector_Params()
+    params.filterByColor    = True
+    params.blobColor        = 255       # svetle luknje
+    params.filterByArea     = True
+    params.minArea          = 50
+    params.maxArea          = 3000
+    params.filterByCircularity = True
+    params.minCircularity   = 0.6
+    params.filterByConvexity   = True
+    params.minConvexity     = 0.7
+    params.filterByInertia     = True
+    params.minInertiaRatio  = 0.4
+
+    detector = cv2.SimpleBlobDetector_create(params)
+    keypoints = detector.detect(gray)
+
+    centers = [(int(kp.pt[0]), int(kp.pt[1])) for kp in keypoints]
+    return centers
+
+
+def estimate_px_per_mm(frames, known_spacing_mm=None):
+    """
+    Iz prvih N okvirjev oceni px_per_mm.
+    Zazna luknje, vzame mediano razdalj med sosednjimi luknjami.
+    known_spacing_mm: razdalja med luknjami v mm (izmerimo iz CAD/opisa)
+    """
+    all_centers = []
+    for frame in frames:
+        centers = detect_holes(frame)
+        all_centers.extend(centers)
+
+    if len(all_centers) < 4:
+        return None, []
+
+    # Povpreči pozicije z mediano (robustno na outlierje)
+    pts = np.array(all_centers, dtype=np.float32)
+
+    # Razdalje med vsemi pari točk
+    dists = []
+    for i in range(len(pts)):
+        for j in range(i+1, len(pts)):
+            d = np.linalg.norm(pts[i] - pts[j])
+            dists.append(d)
+
+    if not dists:
+        return None, all_centers
+
+    dists = np.array(dists)
+
+    # Najdi skupino razdalj ki ustreza sosednjim luknjam
+    # (predpostavljamo da je razdalja med sosednjimi luknjami
+    #  manjša kot diagonalna razdalja)
+    min_d = np.min(dists)
+    # Sosednje razdalje so vse v rangu min_d * 1.5
+    neighbor_dists = dists[dists < min_d * 1.6]
+
+    if len(neighbor_dists) == 0:
+        return None, all_centers
+
+    spacing_px = float(np.median(neighbor_dists))
+
+    if known_spacing_mm is None:
+        # Ocenimo spacing iz dimenzij plošče:
+        # Plošča 320x130mm, 3x3 luknje
+        # Spacing ~ (130mm - 2*okvirja) / 2 ≈ 32mm (tipično za 9HPT)
+        known_spacing_mm = 32.0
+
+    px_per_mm = spacing_px / known_spacing_mm
+    return px_per_mm, all_centers
+
+
+# ── Zaznavanje prijema/spusta pina ────────────────────────────────────────────
+
+class GripDetector:
+    """Zazna prijem in spust pina iz razdalje med palcem in kazalcem."""
+
+    def __init__(self, threshold_mm=GRIP_THRESHOLD_MM, px_per_mm=1.0):
+        self.threshold_px = threshold_mm * px_per_mm
+        self.is_gripping  = False
+        self.grip_events  = []   # seznam (frame, time, 'grip'/'release')
+        self._prev_dist   = None
+
+    def update(self, thumb_px, index_px, frame_idx, time_s):
+        dist = pixel_distance(thumb_px, index_px)
+
+        gripping_now = dist < self.threshold_px
+
+        if gripping_now != self.is_gripping:
+            event_type = "grip" if gripping_now else "release"
+            self.grip_events.append({
+                "frame": frame_idx,
+                "time_s": round(time_s, 3),
+                "type": event_type,
+                "distance_px": round(dist, 1)
+            })
+            self.is_gripping = gripping_now
+
+        self._prev_dist = dist
+        return dist
+
+
 # ── Razred za sledenje kinematike ─────────────────────────────────────────────
 
 class KinematicsTracker:
-    """Sledenje pozicije, poti, hitrosti in pospeška za eno točko."""
-
-    def __init__(self, name: str, fps: float):
+    def __init__(self, name, fps):
         self.name = name
-        self.fps = fps
-        self.dt = 1.0 / fps
+        self.fps  = fps
+        self.dt   = 1.0 / fps
 
-        # Časovne vrste (indeks = številka okvirja)
-        self.positions   = []   # (x, y) v px
-        self.path_length = []   # kumulativna dolžina poti [px]
-        self.velocity    = []   # trenutna hitrost [px/s]
-        self.accel       = []   # pospešek [px/s²]
-        self.timestamps  = []   # čas [s]
+        self.positions    = []
+        self.path_length  = []
+        self.velocity     = []
+        self.accel        = []
+        self.timestamps   = []
 
         self._vel_buf  = deque(maxlen=SMOOTH_WINDOW)
         self._acc_buf  = deque(maxlen=SMOOTH_WINDOW)
@@ -97,7 +209,6 @@ class KinematicsTracker:
         self._frame    = 0
 
     def update(self, pos):
-        """Posodobi tracker z novo pozicijo (x, y) v pikslih."""
         t = self._frame * self.dt
         self.timestamps.append(t)
         self.positions.append(pos)
@@ -107,14 +218,11 @@ class KinematicsTracker:
         if len(self.positions) >= 2:
             d = pixel_distance(self.positions[-1], self.positions[-2])
             self._cum_dist += d
-
-            # Hitrost
             v = d / self.dt
             self._vel_buf.append(v)
             v_smooth = smooth(self._vel_buf)
             self.velocity.append(v_smooth)
 
-            # Pospešek
             if len(self.velocity) >= 2:
                 a = (self.velocity[-1] - self.velocity[-2]) / self.dt
                 self._acc_buf.append(a)
@@ -128,9 +236,8 @@ class KinematicsTracker:
         self.path_length.append(self._cum_dist)
 
     def current_stats(self):
-        """Vrne trenutne vrednosti za prikaz."""
-        v = self.velocity[-1] if self.velocity else 0.0
-        a = self.accel[-1]    if self.accel    else 0.0
+        v = self.velocity[-1]    if self.velocity    else 0.0
+        a = self.accel[-1]       if self.accel       else 0.0
         d = self.path_length[-1] if self.path_length else 0.0
         return d, v, a
 
@@ -140,32 +247,21 @@ class KinematicsTracker:
 
     def to_dict(self):
         return {
-            "name":        self.name,
-            "fps":         self.fps,
-            "timestamps":  self.timestamps,
-            "positions":   self.positions,
-            "path_length": self.path_length,
-            "velocity":    self.velocity,
-            "acceleration":self.accel,
+            "name":         self.name,
+            "fps":          self.fps,
+            "timestamps":   self.timestamps,
+            "positions":    self.positions,
+            "path_length":  self.path_length,
+            "velocity":     self.velocity,
+            "acceleration": self.accel,
         }
 
 
 # ── Glavna funkcija ───────────────────────────────────────────────────────────
 
-def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
-                  show: bool = True):
-    """
-    Obdela video, zaznava roko in izračuna kinematične parametre.
-
-    Args:
-        input_source: pot do video datoteke ali indeks kamere (int)
-        output_dir:   mapa za shranjevanje rezultatov
-        px_per_mm:    umeritveni faktor (privzeto: 1.0 → rezultati v px)
-        show:         ali prikazovati okno med obdelavo
-    """
+def process_video(input_source, output_dir, px_per_mm=None, show=True):
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── Odpri vhodni video ────────────────────────────────────────────────────
     cap = cv2.VideoCapture(input_source)
     if not cap.isOpened():
         raise RuntimeError(f"Ne morem odpreti vira: {input_source}")
@@ -176,15 +272,38 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"[INFO] Vir: {input_source}  |  {W}×{H} @ {fps:.1f} fps  |  {total} okvirjev")
 
+    # ── Faza 1: umerjanje iz prvih CALIB_FRAMES okvirjev ─────────────────────
+    calib_frames = []
+    while len(calib_frames) < CALIB_FRAMES:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        calib_frames.append(frame.copy())
+
+    detected_px_per_mm = None
+    hole_centers       = []
+
+    if px_per_mm is None:
+        print(f"[INFO] Umerjanje iz prvih {len(calib_frames)} okvirjev...")
+        detected_px_per_mm, hole_centers = estimate_px_per_mm(calib_frames)
+        if detected_px_per_mm:
+            px_per_mm = detected_px_per_mm
+            print(f"[INFO] Zaznane luknje: {len(hole_centers)}  |  px_per_mm = {px_per_mm:.3f}")
+        else:
+            px_per_mm = 1.0
+            print(f"[WARN] Umerjanje ni uspelo – luknje niso zaznane. Uporabljam px_per_mm=1.0")
+    else:
+        print(f"[INFO] Ročni px_per_mm = {px_per_mm:.3f}")
+
     # ── Video writer ──────────────────────────────────────────────────────────
     out_path = os.path.join(output_dir, "annotated.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
+    fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
+    writer   = cv2.VideoWriter(out_path, fourcc, fps, (W, H))
 
-    # ── MediaPipe inicializacija ──────────────────────────────────────────────
-    mp_hands   = mp.solutions.hands
-    mp_draw    = mp.solutions.drawing_utils
-    mp_styles  = mp.solutions.drawing_styles
+    # ── MediaPipe ─────────────────────────────────────────────────────────────
+    mp_hands  = mp.solutions.hands
+    mp_draw   = mp.solutions.drawing_utils
+    mp_styles = mp.solutions.drawing_styles
 
     hands = mp_hands.Hands(
         static_image_mode=False,
@@ -193,36 +312,37 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
         min_tracking_confidence=0.5,
     )
 
-    # ── Trackerji ─────────────────────────────────────────────────────────────
-    wrist_t = KinematicsTracker("wrist",  fps)
-    thumb_t = KinematicsTracker("thumb",  fps)
-    index_t = KinematicsTracker("index",  fps)
+    # ── Trackerji in grip detektor ────────────────────────────────────────────
+    wrist_t = KinematicsTracker("wrist", fps)
+    thumb_t = KinematicsTracker("thumb", fps)
+    index_t = KinematicsTracker("index", fps)
+    grip    = GripDetector(threshold_mm=GRIP_THRESHOLD_MM, px_per_mm=px_per_mm)
 
-    frame_idx = 0
-    t0 = time.time()
+    # Najprej obdelaj kalibracijske okvirje
+    all_frames = calib_frames
+    frame_idx  = 0
+    t0         = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def process_frame(frame, frame_idx):
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
 
-        detected = False
+        # Nariši zaznane luknje na prvih okvirjih
+        if frame_idx < CALIB_FRAMES and hole_centers:
+            for cx, cy in hole_centers:
+                cv2.circle(frame, (cx, cy), 8, (0, 255, 255), 2)
 
+        detected = False
         if result.multi_hand_landmarks:
             for hand_lm in result.multi_hand_landmarks:
                 detected = True
 
-                # Nariši skelet roke
                 mp_draw.draw_landmarks(
                     frame, hand_lm, mp_hands.HAND_CONNECTIONS,
                     mp_styles.get_default_hand_landmarks_style(),
                     mp_styles.get_default_hand_connections_style()
                 )
 
-                # Izvleči koordinate v pikslih
                 def lm_px(idx):
                     lm = hand_lm.landmark[idx]
                     return (int(lm.x * W), int(lm.y * H))
@@ -231,44 +351,83 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
                 thumb_px = lm_px(THUMB_TIP)
                 index_px = lm_px(INDEX_TIP)
 
-                # Posodobi trackerje
                 wrist_t.update(wrist_px)
                 thumb_t.update(thumb_px)
                 index_t.update(index_px)
 
-                # Nariši sledi
+                t_s      = frame_idx / fps
+                dist_px  = grip.update(thumb_px, index_px, frame_idx, t_s)
+                dist_mm  = dist_px / px_per_mm
+
                 draw_trail(frame, wrist_t.trail, COLOR_TRAIL)
                 draw_trail(frame, thumb_t.trail, COLOR_THUMB)
                 draw_trail(frame, index_t.trail, COLOR_INDEX)
 
-                # Označi konice prstov
                 cv2.circle(frame, thumb_px, 8, COLOR_THUMB, -1)
                 cv2.circle(frame, index_px, 8, COLOR_INDEX, -1)
                 cv2.circle(frame, wrist_px, 6, COLOR_HAND,  -1)
 
-                # Prikaži trenutne statistike
-                wd, wv, wa = wrist_t.current_stats()
-                td, tv, ta = thumb_t.current_stats()
-                id_, iv, ia = index_t.current_stats()
+                # Linija med palcem in kazalcem + barva glede na prijem
+                grip_color = COLOR_GRIP if grip.is_gripping else COLOR_RELEASE
+                cv2.line(frame, thumb_px, index_px, grip_color, 2)
+
+                # Indikator prijema
+                grip_text  = "PRIJEM" if grip.is_gripping else "SPUST"
+                grip_label_color = (0, 0, 255) if grip.is_gripping else (0, 200, 0)
+                cv2.putText(frame, grip_text,
+                            (W - 160, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                            (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, grip_text,
+                            (W - 160, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                            grip_label_color, 2, cv2.LINE_AA)
+
+                wd, wv, wa   = wrist_t.current_stats()
+                td, tv, ta   = thumb_t.current_stats()
+                id_, iv, ia  = index_t.current_stats()
 
                 lines = [
                     f"Frame: {frame_idx:5d}   t={frame_idx/fps:.2f}s",
+                    f"px/mm={px_per_mm:.2f}  d(thumb-idx)={dist_mm:.1f}mm",
                     f"WRIST  d={wd/px_per_mm:6.1f}mm  v={wv/px_per_mm:6.1f}mm/s  a={wa/px_per_mm:7.1f}mm/s2",
                     f"THUMB  d={td/px_per_mm:6.1f}mm  v={tv/px_per_mm:6.1f}mm/s  a={ta/px_per_mm:7.1f}mm/s2",
                     f"INDEX  d={id_/px_per_mm:6.1f}mm  v={iv/px_per_mm:6.1f}mm/s  a={ia/px_per_mm:7.1f}mm/s2",
                 ]
                 overlay_text(frame, lines)
-                break  # samo ena roka
+                break
 
         if not detected:
             overlay_text(frame, [f"Frame: {frame_idx:5d} – roka ni zaznana"])
 
-        writer.write(frame)
+        return frame
+
+    # Obdelaj kalibracijske okvirje
+    for frame in all_frames:
+        processed = process_frame(frame, frame_idx)
+        writer.write(processed)
+        if show:
+            cv2.imshow("9HPT – Kinematika roke", processed)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                cap.release()
+                writer.release()
+                hands.close()
+                cv2.destroyAllWindows()
+                return
+        frame_idx += 1
+
+    # Obdelaj preostanek videa
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        processed = process_frame(frame, frame_idx)
+        writer.write(processed)
 
         if show:
-            cv2.imshow("9HPT – Kinematika roke", frame)
+            cv2.imshow("9HPT – Kinematika roke", processed)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[INFO] Zaustavljeno s tipko 'q'.")
                 break
 
         frame_idx += 1
@@ -287,10 +446,13 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
 
     # ── Shrani rezultate ──────────────────────────────────────────────────────
     results = {
-        "source":      str(input_source),
-        "fps":         fps,
-        "px_per_mm":   px_per_mm,
-        "total_frames":frame_idx,
+        "source":        str(input_source),
+        "fps":           fps,
+        "px_per_mm":     px_per_mm,
+        "calib_auto":    detected_px_per_mm is not None,
+        "holes_detected":len(hole_centers),
+        "total_frames":  frame_idx,
+        "grip_events":   grip.grip_events,
         "trackers": {
             "wrist": wrist_t.to_dict(),
             "thumb": thumb_t.to_dict(),
@@ -303,32 +465,38 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
         json.dump(results, f, indent=2)
     print(f"[INFO] Kinematični podatki (JSON): {json_path}")
 
-    # CSV za wrist (za Excel / vrednotenje)
     csv_path = os.path.join(output_dir, "wrist_kinematics.csv")
     with open(csv_path, "w", newline="") as f:
-        writer_csv = csv.writer(f)
-        writer_csv.writerow(["frame", "time_s", "x_px", "y_px",
-                              "path_mm", "velocity_mm_s", "accel_mm_s2"])
+        w = csv.writer(f)
+        w.writerow(["frame", "time_s", "x_px", "y_px",
+                    "path_mm", "velocity_mm_s", "accel_mm_s2", "grip"])
+        grip_frames = {e["frame"]: e["type"] for e in grip.grip_events}
         for i, (t, pos, d, v, a) in enumerate(zip(
                 wrist_t.timestamps, wrist_t.positions,
                 wrist_t.path_length, wrist_t.velocity, wrist_t.accel)):
-            writer_csv.writerow([
+            w.writerow([
                 i, f"{t:.4f}", pos[0], pos[1],
                 f"{d/px_per_mm:.3f}",
                 f"{v/px_per_mm:.3f}",
                 f"{a/px_per_mm:.3f}",
+                grip_frames.get(i, ""),
             ])
     print(f"[INFO] Wrist CSV: {csv_path}")
 
-    # Izpiši povzetek
+    # Izpiši grip evenimente
+    if grip.grip_events:
+        print(f"\n── GRIP DOGODKI ({len(grip.grip_events)}) ──────────────────")
+        for e in grip.grip_events:
+            print(f"  {e['type']:8s}  t={e['time_s']:.2f}s  frame={e['frame']}")
+
     print("\n── POVZETEK ──────────────────────────────────────────────────")
     for name, tracker in [("Wrist", wrist_t), ("Thumb", thumb_t), ("Index", index_t)]:
         if tracker.path_length:
-            max_v = max(tracker.velocity) / px_per_mm
-            avg_v = np.mean(tracker.velocity) / px_per_mm
+            max_v   = max(tracker.velocity) / px_per_mm
+            avg_v   = np.mean(tracker.velocity) / px_per_mm
             total_d = tracker.path_length[-1] / px_per_mm
             print(f"  {name:6s}: skupna pot={total_d:.1f} mm  "
-                  f"avg hitrost={avg_v:.1f} mm/s  max hitrost={max_v:.1f} mm/s")
+                  f"avg v={avg_v:.1f} mm/s  max v={max_v:.1f} mm/s")
     print("──────────────────────────────────────────────────────────────\n")
 
     return results
@@ -337,20 +505,14 @@ def process_video(input_source, output_dir: str, px_per_mm: float = 1.0,
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="9HPT Robotski vid – kinematika roke"
-    )
-    parser.add_argument("--input",  default="0",
-                        help="Pot do video datoteke ali indeks kamere (privzeto: 0)")
-    parser.add_argument("--output", default="data/results",
-                        help="Mapa za shranjevanje rezultatov")
-    parser.add_argument("--px_per_mm", type=float, default=1.0,
-                        help="Umeritveni faktor px/mm (privzeto: 1.0)")
-    parser.add_argument("--no-show", action="store_true",
-                        help="Ne prikazuj okna med obdelavo")
+    parser = argparse.ArgumentParser(description="9HPT Robotski vid – kinematika roke")
+    parser.add_argument("--input",     default="0")
+    parser.add_argument("--output",    default="data/results")
+    parser.add_argument("--px_per_mm", type=float, default=None,
+                        help="Ročni umeritveni faktor (privzeto: avtomatsko)")
+    parser.add_argument("--no-show",   action="store_true")
     args = parser.parse_args()
 
-    # Pretvori "0" v int za webcam
     source = int(args.input) if args.input.isdigit() else args.input
 
     process_video(
