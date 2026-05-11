@@ -81,24 +81,20 @@ def overlay_text(frame, lines, x=10, y=20, dy=22):
 # ── Zaznavanje lukenj za umerjanje ────────────────────────────────────────────
 
 def detect_holes(frame):
-    """
-    Zazna svetle luknje na plošči z blob detektorjem.
-    Vrne seznam centrov lukenj v pikslih ali prazen seznam.
-    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     params = cv2.SimpleBlobDetector_Params()
-    params.filterByColor    = True
-    params.blobColor        = 255       # svetle luknje
-    params.filterByArea     = True
-    params.minArea          = 50
-    params.maxArea          = 3000
+    params.filterByColor       = True
+    params.blobColor           = 255
+    params.filterByArea        = True
+    params.minArea             = 40        # bilo 50 - znižamo
+    params.maxArea             = 600       # bilo 3000 - znižamo, luknje so ~50-70
     params.filterByCircularity = True
-    params.minCircularity   = 0.6
+    params.minCircularity      = 0.4       # bilo 0.6 - znižamo ker so luknje 9x10
     params.filterByConvexity   = True
-    params.minConvexity     = 0.7
+    params.minConvexity        = 0.6       # bilo 0.7
     params.filterByInertia     = True
-    params.minInertiaRatio  = 0.4
+    params.minInertiaRatio     = 0.3       # bilo 0.4
 
     detector = cv2.SimpleBlobDetector_create(params)
     keypoints = detector.detect(gray)
