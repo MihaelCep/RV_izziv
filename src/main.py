@@ -117,9 +117,14 @@ def estimate_px_per_mm(frames, known_spacing_mm=None):
     known_spacing_mm: razdalja med luknjami v mm (izmerimo iz CAD/opisa)
     """
     all_centers = []
+    best_count = 0
+    best_centers = []
     for frame in frames:
         centers = detect_holes(frame)
-        all_centers.extend(centers)
+        if len(centers) > best_count:
+            best_count = len(centers)
+            best_centers = centers
+    all_centers = best_centers
 
     if len(all_centers) < 4:
         return None, []
